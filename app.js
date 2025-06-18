@@ -16,7 +16,7 @@ const CONFIG = {
     CHECK_INTERNET_URL: 'http://www.google.com',
     MAX_RETRIES: 3,
     RETRY_DELAY: 10000, 
-    PORT: 3000
+    PORT: process.env.PORT || 3000  // Use Render's PORT environment variable
 };
 
 // ---------------------- GLOBAL STATE ----------------------
@@ -233,8 +233,25 @@ async function processCID(cid) {
 
 async function scrapingWorker() {
     try {
-        // Setup browser
+        // Setup browser with Render-specific options
         const options = new chrome.Options();
+        
+        // Configure for Render's environment
+        options.addArguments(
+            '--no-sandbox',
+            '--disable-dev-shm-usage',
+            '--headless=new',
+            '--disable-gpu',
+            '--window-size=1280,720'
+        );
+        
+        // Use unique temp directory for user data
+        const tempDir = fs.mkdtempSync('/tmp/chrome-');
+        options.addArguments(`--user-data-dir=${tempDir}`);
+        
+        // Set binary path if needed (uncomment if you have chrome installed in a specific location)
+        // options.setChromeBinaryPath('/usr/bin/google-chrome');
+
         driver = await new Builder()
             .forBrowser('chrome')
             .setChromeOptions(options)
