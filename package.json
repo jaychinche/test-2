@@ -1,0 +1,28 @@
+{
+  "name": "test",
+  "version": "1.0.0",
+  "description": "Electricity Bill Scraper with Selenium and Express",
+  "main": "server.js",
+  "scripts": {
+    "start": "node app.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jaychinche/test.git"
+  },
+  "keywords": [],
+  "author": "Jay Chinche",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/jaychinche/test/issues"
+  },
+  "homepage": "https://github.com/jaychinche/test#readme",
+  "dependencies": {
+    "axios": "^1.10.0",
+    "chromedriver": "^137.0.3",
+    "express": "^5.1.0",
+    "selenium-webdriver": "^4.33.0",
+    "xlsx": "^0.18.5"
+  }
+}
