@@ -6,6 +6,8 @@ const fs = require('fs');
 const path = require('path');
 const xlsx = require('xlsx');
 const axios = require('axios');
+const { Worker, isMainThread, parentPort, workerData } = require('worker_threads');
+const os = require('os');
 
 const CONFIG = {
     INPUT_FILE: path.join(__dirname, 'data/input/VSKP1_data.xlsx'),
@@ -15,15 +17,19 @@ const CONFIG = {
     URL: 'https://www.apeasternpower.com/viewBillDetailsMain',
     CHECK_INTERNET_URL: 'http://www.google.com',
     MAX_RETRIES: 3,
-    RETRY_DELAY: 10000, 
-    PORT: process.env.PORT || 3000  // Use Render's PORT environment variable
+    RETRY_DELAY: 10000,
+    BATCH_SIZE: 10,
+    PORT: process.env.PORT || 3000,
+    MAX_WORKERS: Math.max(1, Math.min(4, os.cpus().length - 1)) // Use 1-4 workers based on CPU cores
 };
 
 // ---------------------- GLOBAL STATE ----------------------
 let shouldPause = false;
 let shouldStop = false;
-let scraperThread = null;
-let driver = null;
+let activeWorkers = 0;
+let processingActive = false;
+let workerThreads = [];
+let failedCount = 0;
 
 // ---------------------- HELPER FUNCTIONS ----------------------
 async function checkInternetConnection() {
@@ -37,7 +43,7 @@ async function checkInternetConnection() {
 
 async function waitForInternet() {
     console.log('🌐 Waiting for internet connection...');
-    while (!(await checkInternetConnection())) {
+    while (!(await checkInternetConnection()) && !shouldStop) {
         await new Promise(resolve => setTimeout(resolve, 5000));
     }
     console.log('🌐 Internet connection restored');
@@ -52,15 +58,12 @@ function loadStatus() {
     } catch (error) {
         console.log(`⚠ Couldn't read status file: ${error.message}`);
     }
-    return { last_processed: 0, total_processed: 0 };
+    return { last_processed: 0, total_processed: 0, total_failed: 0 };
 }
 
-function saveStatus(lastProcessed, totalProcessed) {
+function saveStatus(status) {
     try {
-        fs.writeFileSync(CONFIG.STATUS_FILE, JSON.stringify({
-            last_processed: lastProcessed,
-            total_processed: totalProcessed
-        }));
+        fs.writeFileSync(CONFIG.STATUS_FILE, JSON.stringify(status));
     } catch (error) {
         console.log(`⚠ Couldn't save status file: ${error.message}`);
     }
@@ -71,7 +74,7 @@ function loadExistingData() {
     let existingFailed = new Set();
 
     // Load successful data
-    if (fs.existsSync(CONFIG.OUTPUT_FILE) && fs.statSync(CONFIG.OUTPUT_FILE).size > 0) {
+    if (fs.existsSync(CONFIG.OUTPUT_FILE)) {
         try {
             const workbook = xlsx.readFile(CONFIG.OUTPUT_FILE);
             const sheetName = workbook.SheetNames[0];
@@ -83,7 +86,7 @@ function loadExistingData() {
     }
 
     // Load failed CIDs
-    if (fs.existsSync(CONFIG.FAILED_FILE) && fs.statSync(CONFIG.FAILED_FILE).size > 0) {
+    if (fs.existsSync(CONFIG.FAILED_FILE)) {
         try {
             const data = fs.readFileSync(CONFIG.FAILED_FILE, 'utf8');
             existingFailed = new Set(JSON.parse(data));
@@ -105,20 +108,7 @@ function saveData(outputData, notScraped) {
 
         // Save failed CIDs
         if (notScraped && notScraped.size > 0) {
-            // Load existing failed CIDs to avoid duplicates
-            let existingFailed = new Set();
-            if (fs.existsSync(CONFIG.FAILED_FILE) && fs.statSync(CONFIG.FAILED_FILE).size > 0) {
-                try {
-                    const data = fs.readFileSync(CONFIG.FAILED_FILE, 'utf8');
-                    existingFailed = new Set(JSON.parse(data));
-                } catch (error) {
-                    console.log(`⚠ Couldn't read failed JSON file: ${error.message}`);
-                }
-            }
-
-            // Merge sets
-            const mergedFailed = new Set([...existingFailed, ...notScraped]);
-            fs.writeFileSync(CONFIG.FAILED_FILE, JSON.stringify([...mergedFailed], null, 4));
+            fs.writeFileSync(CONFIG.FAILED_FILE, JSON.stringify([...notScraped], null, 4));
             console.log(`⚠ Failed CIDs saved to ${CONFIG.FAILED_FILE}`);
         }
     } catch (error) {
@@ -129,25 +119,26 @@ function saveData(outputData, notScraped) {
 async function checkPause() {
     if (shouldPause) {
         console.log('⏸ Scraping paused. Send a POST request to /resume to resume or /stop to stop');
-        while (shouldPause) {
+        while (shouldPause && !shouldStop) {
             await new Promise(resolve => setTimeout(resolve, 1000));
-            if (shouldStop) {
-                console.log('🛑 Stopping as requested during pause');
-                return true;
-            }
+        }
+        if (shouldStop) {
+            console.log('🛑 Stopping as requested during pause');
+            return true;
         }
         console.log('▶ Resuming scraping...');
     }
     return false;
 }
 
-async function processCID(cid) {
+async function processCID(driver, cid) {
     let retries = 0;
     
-    while (retries < CONFIG.MAX_RETRIES) {
+    while (retries < CONFIG.MAX_RETRIES && !shouldStop) {
         try {
             if (!(await checkInternetConnection())) {
                 await waitForInternet();
+                if (shouldStop) return null;
             }
 
             await driver.get(CONFIG.URL);
@@ -222,25 +213,25 @@ async function processCID(cid) {
         } catch (error) {
             retries++;
             console.log(`⚠ Attempt ${retries}/${CONFIG.MAX_RETRIES} failed for CID ${cid}: ${error.message.slice(0, 100)}`);
-            if (retries < CONFIG.MAX_RETRIES) {
+            if (retries < CONFIG.MAX_RETRIES && !shouldStop) {
                 await new Promise(resolve => setTimeout(resolve, CONFIG.RETRY_DELAY));
             } else {
                 throw error;
             }
         }
     }
+    return null;
 }
 
-async function scrapingWorker() {
+async function workerThread(workerId) {
+    let driver = null;
     try {
-        // Setup browser with Render-specific options
+        // Setup browser with optimized configuration
         const options = new chrome.Options();
-        
-        // Configure for Render's environment
         options.addArguments(
+            '--headless=new',
             '--no-sandbox',
             '--disable-dev-shm-usage',
-            '--headless=new',
             '--disable-gpu',
             '--window-size=1280,720'
         );
@@ -249,15 +240,14 @@ async function scrapingWorker() {
         const tempDir = fs.mkdtempSync('/tmp/chrome-');
         options.addArguments(`--user-data-dir=${tempDir}`);
         
-        // Set binary path if needed (uncomment if you have chrome installed in a specific location)
-        // options.setChromeBinaryPath('/usr/bin/google-chrome');
-
         driver = await new Builder()
             .forBrowser('chrome')
             .setChromeOptions(options)
             .build();
 
-        // Load data
+        console.log(`👷 Worker ${workerId} started`);
+
+        // Load input data
         const workbook = xlsx.readFile(CONFIG.INPUT_FILE);
         const sheetName = workbook.SheetNames[0];
         const worksheet = workbook.Sheets[sheetName];
@@ -270,101 +260,175 @@ async function scrapingWorker() {
         const outputData = Array.isArray(existingData) ? [...existingData] : [];
         const notScraped = new Set(existingFailed);
         
-        // Track counts
         const total = cidList.length;
-        let successCount = status.total_processed || 0;
-        let failedCount = notScraped.size;
-        let startIndex = status.last_processed || 0;
+        let processedCount = 0;
+        let failedCount = status.total_failed || 0;
         
-        console.log(`Starting scraping from index ${startIndex} of ${total} CIDs`);
-        console.log(`Previously processed: ${successCount} success, ${failedCount} failed`);
-
-        for (let index = startIndex; index < total; index++) {
-            if (shouldStop) {
-                console.log('🛑 Stopping as requested');
-                break;
-            }
-            
+        while (!shouldStop) {
             if (await checkPause()) {
                 shouldStop = true;
                 break;
             }
             
-            const cid = cidList[index];
+            // Get next batch of CIDs to process
+            const batchStart = status.last_processed;
+            const batchEnd = Math.min(batchStart + CONFIG.BATCH_SIZE, total);
             
-            // Skip already processed CIDs
-            const alreadyProcessed = outputData.some(item => item.CID === cid) || notScraped.has(cid);
-            if (alreadyProcessed) continue;
-                
-            console.log(`🔍 Processing CID ${cid} (${index + 1}/${total})`);
-            
-            try {
-                const cidData = await processCID(cid);
-                outputData.push({ CID: cid, ...cidData });
-                successCount++;
-                console.log(`✅ Successfully scraped CID ${cid}`);
-                
-            } catch (error) {
-                console.log(`❌ Failed to scrape CID ${cid}: ${error.message.slice(0, 100)}...`);
-                notScraped.add(cid);
-                failedCount++;
+            if (batchStart >= total) {
+                console.log(`ℹ Worker ${workerId}: No more CIDs to process`);
+                break;
             }
-
-            // Save progress
-            saveStatus(index + 1, successCount);
             
-            // Periodic save every 10 CIDs
-            if ((index + 1) % 10 === 0) {
+            const batch = cidList.slice(batchStart, batchEnd);
+            console.log(`👷 Worker ${workerId} processing batch of ${batch.length} CIDs (${batchStart+1}-${batchEnd} of ${total})`);
+            
+            const processedIds = [];
+            const failedIds = [];
+            
+            for (const cid of batch) {
+                if (shouldStop) break;
+                
+                // Skip already processed CIDs
+                if (outputData.some(item => item.CID === cid) || notScraped.has(cid)) {
+                    continue;
+                }
+                
+                console.log(`🔍 Worker ${workerId} processing CID ${cid}`);
+                
+                try {
+                    const cidData = await processCID(driver, cid);
+                    if (cidData) {
+                        outputData.push({ CID: cid, ...cidData });
+                        processedIds.push(cid);
+                        processedCount++;
+                        console.log(`✅ Worker ${workerId} processed CID ${cid}`);
+                    } else {
+                        throw new Error('No data returned from scraping');
+                    }
+                } catch (error) {
+                    console.log(`❌ Worker ${workerId} failed to process CID ${cid}: ${error.message.slice(0, 100)}...`);
+                    notScraped.add(cid);
+                    failedIds.push(cid);
+                    failedCount++;
+                }
+            }
+            
+            // Update status
+            status.last_processed = batchEnd;
+            status.total_processed = (status.total_processed || 0) + processedIds.length;
+            status.total_failed = failedCount;
+            saveStatus(status);
+            
+            // Save data periodically
+            if (processedIds.length > 0 || failedIds.length > 0) {
                 saveData(outputData, notScraped);
-                console.log(`↻ Saved progress: ${successCount} success, ${failedCount} failed`);
+                console.log(`📊 Worker ${workerId} batch results: ${processedIds.length} success, ${failedIds.length} failed`);
             }
+            
+            // Small delay between batches
+            await new Promise(resolve => setTimeout(resolve, 1000));
         }
-
-        // Final save
-        saveData(outputData, notScraped);
         
-        console.log('\n🎉 Scraping completed. Results:');
-        console.log(`Total CIDs: ${total}`);
-        console.log(`Successfully scraped: ${successCount}`);
-        console.log(`Failed to scrape: ${failedCount}`);
-        console.log(`Success rate: ${(successCount / total * 100).toFixed(2)}%`);
+        console.log(`🏁 Worker ${workerId} finished processing`);
         
     } catch (error) {
-        console.log(`❌ Scraping failed with error: ${error.message}`);
+        console.log(`❌ Worker ${workerId} crashed: ${error.message}`);
     } finally {
+        activeWorkers--;
         if (driver) {
             await driver.quit();
-            console.log('🚪 Browser closed');
+            console.log(`🚪 Worker ${workerId} browser closed`);
         }
     }
+}
+
+async function startScraping() {
+    if (processingActive) {
+        throw new Error('Scraping is already running');
+    }
+    
+    shouldPause = false;
+    shouldStop = false;
+    processingActive = true;
+    failedCount = 0;
+    
+    // Initialize status if not exists
+    if (!fs.existsSync(CONFIG.STATUS_FILE)) {
+        saveStatus({ last_processed: 0, total_processed: 0, total_failed: 0 });
+    }
+    
+    // Determine number of workers to use
+    const numWorkers = CONFIG.MAX_WORKERS;
+    activeWorkers = numWorkers;
+    
+    console.log(`🚀 Starting scraping with ${numWorkers} workers`);
+    
+    // Start worker threads
+    for (let i = 1; i <= numWorkers; i++) {
+        const worker = new Worker(__filename, { 
+            workerData: { 
+                workerId: i,
+                config: CONFIG 
+            } 
+        });
+        
+        worker.on('message', (message) => {
+            console.log(`Worker ${i}: ${message}`);
+        });
+        
+        worker.on('error', (error) => {
+            console.error(`Worker ${i} error:`, error);
+        });
+        
+        worker.on('exit', (code) => {
+            if (code !== 0) {
+                console.error(`Worker ${i} stopped with exit code ${code}`);
+            }
+            activeWorkers--;
+            if (activeWorkers === 0) {
+                processingActive = false;
+                console.log('🎉 All workers finished');
+            }
+        });
+        
+        workerThreads.push(worker);
+    }
+}
+
+async function stopScraping() {
+    shouldStop = true;
+    processingActive = false;
+    
+    // Wait for all workers to finish
+    while (activeWorkers > 0) {
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    workerThreads = [];
 }
 
 // ---------------------- API ENDPOINTS ----------------------
 app.use(express.json());
 
-app.post('/start', (req, res) => {
-    if (scraperThread) {
-        return res.status(400).json({ message: 'Scraping is already running' });
+app.post('/start', async (req, res) => {
+    try {
+        await startScraping();
+        res.json({ 
+            message: `🚀 Scraping started with ${CONFIG.MAX_WORKERS} workers`,
+            workers: CONFIG.MAX_WORKERS
+        });
+    } catch (error) {
+        res.status(400).json({ error: error.message });
     }
-    
-    shouldPause = false;
-    shouldStop = false;
-    
-    scraperThread = (async () => {
-        await scrapingWorker();
-        scraperThread = null;
-    })();
-    
-    res.json({ message: '🚀 Scraping started' });
 });
 
 app.post('/pause', (req, res) => {
-    if (!scraperThread) {
+    if (!processingActive) {
         return res.status(400).json({ message: 'No active scraping to pause' });
     }
     
     shouldPause = true;
-    res.json({ message: '⏸ Pause requested. Will pause after current CID completes.' });
+    res.json({ message: '⏸ Pause requested' });
 });
 
 app.post('/resume', (req, res) => {
@@ -376,41 +440,34 @@ app.post('/resume', (req, res) => {
     res.json({ message: '▶ Resuming scraping...' });
 });
 
-app.post('/stop', (req, res) => {
-    if (!scraperThread) {
+app.post('/stop', async (req, res) => {
+    if (!processingActive) {
         return res.status(400).json({ message: 'No active scraping to stop' });
     }
     
-    shouldStop = true;
-    res.json({ message: '🛑 Stop requested. Will stop after current CID completes.' });
+    await stopScraping();
+    res.json({ message: '🛑 Scraping stopped' });
 });
 
 app.get('/status', (req, res) => {
-    if (!scraperThread) {
-        return res.status(400).json({ status: 'No scraping session exists' });
-    }
+    const status = loadStatus();
     
-    let status;
-    if (shouldPause) {
-        status = '⏸ Scraping is currently paused';
-    } else if (shouldStop) {
-        status = '🛑 Scraping is stopping...';
-    } else {
-        status = '▶ Scraping is running';
-    }
-    
-    res.json({ status });
+    res.json({
+        processing_active: processingActive,
+        active_workers: activeWorkers,
+        paused: shouldPause,
+        stopped: shouldStop,
+        last_processed: status.last_processed,
+        total_processed: status.total_processed,
+        total_failed: status.total_failed
+    });
 });
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     console.log('\n🛑 Received interrupt signal. Stopping gracefully...');
-    shouldStop = true;
-    if (driver) {
-        driver.quit().then(() => process.exit(0));
-    } else {
-        process.exit(0);
-    }
+    await stopScraping();
+    process.exit(0);
 });
 
 // Start server
@@ -423,3 +480,15 @@ app.listen(CONFIG.PORT, () => {
     console.log('POST /stop - Stop scraping');
     console.log('GET /status - Check status');
 });
+
+// Worker thread entry point
+if (!isMainThread) {
+    (async () => {
+        try {
+            await workerThread(workerData.workerId);
+            parentPort.postMessage('Worker finished');
+        } catch (error) {
+            parentPort.postMessage(`Worker error: ${error.message}`);
+        }
+    })();
+}
